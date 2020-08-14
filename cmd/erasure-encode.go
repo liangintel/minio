@@ -16,13 +16,31 @@
 
 package cmd
 
+/*
+#cgo CFLAGS: -I/opt/stack/qat/quickassist/lookaside/access_layer/src/sample_code/functional/sym/qat_hash
+#cgo LDFLAGS:  -lssl -lcrypto -lqat_hash -L/opt/stack/qat/quickassist/lookaside/access_layer/src/sample_code/functional/sym/qat_hash
+#include <stdio.h>
+#include <stdlib.h>
+#include <openssl/md5.h> //may need to install `apt install libssl-dev`
+#include "qat_hash.h"
+
+*/
+import "C"
+
 import (
 	"context"
 	"io"
 
 	"sync"
+	//"reflect"
+	"unsafe"
+	//"fmt"
+	//"sync/atomic"
+	//"time"
+	golog "log"
 
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/hash"
 )
 
 // Writes in parallel to writers
@@ -69,15 +87,56 @@ func (p *parallelWriter) Write(ctx context.Context, blocks [][]byte) error {
 	return reduceWriteQuorumErrs(ctx, p.errs, objectOpIgnoredErrs, p.writeQuorum)
 }
 
+const PIECE_NUM = 32
+const PIECE_SIZE = (4*1024*1024)
+var g_request_cnt int32 = 0
 // Encode reads from the reader, erasure-encodes the data and writes to the writers.
-func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer, buf []byte, quorum int) (total int64, err error) {
+func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer, buf_ori []byte, quorum int) (total int64, err error) {
 	writer := &parallelWriter{
 		writers:     writers,
 		writeQuorum: quorum,
 		errs:        make([]error, len(writers)),
 	}
 
-	for {
+	max_object_size := int(C.get_max_object_size()) * (1024*1024)
+	piece_size := int(C.get_cont_piece_size())
+	piece_num := max_object_size / piece_size
+	if(piece_num != PIECE_NUM) {
+		golog.Println("Failure: piece_num mismatch!")
+	}
+
+	eng_i := -1
+	buf := buf_ori[:]
+	var buff_arr *[PIECE_NUM]uintptr
+	buf_i := 0
+	r, ok := src.(*hash.Reader)
+    if ok {
+		eng_i = r.GetQATEng()
+		
+		//tp := reflect.TypeOf(r).String()
+		//golog.Println("Encode() eng_i=", eng_i, "ok=", ok)
+	}
+	
+	if(eng_i >= 0) {
+		buff_arr_ := C.get_engine_buffs(C.int(eng_i))
+		buff_arr = (*[PIECE_NUM]uintptr)(buff_arr_)
+		//golog.Println(buff_arr)
+	}
+
+	defer func() {
+		if(eng_i >= 0) {
+			//release qat engine
+			r.PutQATEng()
+		}
+	} ()
+	
+	for ; ; buf_i++ {
+		if(eng_i >= 0) {
+			buf_ := (*[PIECE_SIZE]byte)(unsafe.Pointer(buff_arr[buf_i]))
+			buf = buf_[:]
+			//golog.Println("len(buf)=", len(buf), buf[0], buf[1], buf[2], buf[PIECE_SIZE-1])
+			//buf = buf_ori[:]
+		}
 		var blocks [][]byte
 		n, err := io.ReadFull(src, buf)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
@@ -105,5 +164,16 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			break
 		}
 	}
+	if(eng_i >= 0) {
+		//write data (offset)
+		ret := C.md5_write(C.int(eng_i), (*C.uchar)(unsafe.Pointer(&buf[0])), C.int(total), 0);
+		if ret != 0 {
+			golog.Println("======= md5_write failure =========")
+		}
+		
+		//calculate md5
+		r.MD5Sum()
+	}
+		
 	return total, nil
 }
