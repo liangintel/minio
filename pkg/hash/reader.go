@@ -41,13 +41,12 @@ import (
 	"reflect"
 	"time"
 	
-//	"github.com/minio/minio/cmd/logger"
-//
-//	"github.com/minio/minio/pkg/console"
 	golog "log"
+	"sync/atomic"
 //	"runtime/debug"
 
 	sha256 "github.com/minio/sha256-simd"
+	humanize "github.com/dustin/go-humanize"
 )
 
 var init_once sync.Once
@@ -56,10 +55,10 @@ var max_engine int = 0
 var chan_engines chan int
 
 var sw int = 1
-var inflight_engine_num int = 0
+var inflight_engine_num int32 = 0
 
 // The size of an MD5 checksum in bytes.
-const Size = 16
+const Md5Size = 16
 
 
 func Init() {
@@ -79,6 +78,8 @@ func Init() {
 		}
 		chan_engines<-int(eng_i)
 	}
+	
+	init_sum_threads()
 	
 	inited = 1
 	fmt.Println("inited.")
@@ -100,7 +101,7 @@ func New() hash.Hash {
 	return m
 }
 
-func (m *md5cache) Size() int { return Size }
+func (m *md5cache) Size() int { return Md5Size }
 
 func (m *md5cache) Write(data []byte) (nn int, err error) {
 	// data is already written to the qat buffer
@@ -110,7 +111,6 @@ func (m *md5cache) Write(data []byte) (nn int, err error) {
 
 func (m *md5cache) Sum(data []byte) []byte {
 	inflight := <- m.sum_inflight
-	//fmt.Println("Sum. ", inflight)
 
 	if(m.digest[0] != 0 || m.digest[1] != 0 || m.digest[2] != 0) {
 		//fmt.Println("digest2:", hex.EncodeToString(m.digest))
@@ -134,6 +134,10 @@ func (m *md5cache) Sum(data []byte) []byte {
 		golog.Println("======= md5_sum failure =========")
 	}
 	
+	chan_engines <- m.eng_i
+	m.eng_i = -1
+	atomic.AddInt32(&inflight_engine_num, -1)
+	
 	//fmt.Println(m.blocksize, "digest:", hex.EncodeToString(m.digest))
 	m.sum_inflight <- (inflight + 1)
 
@@ -152,6 +156,28 @@ func (m *md5cache) BlockSize() int {
 	return m.blocksize
 }
 
+var max_r int = 120
+var max_thread int = 120
+var chan_r chan *Reader
+
+func init_sum_threads() {
+	chan_r = make(chan *Reader, max_r)
+	for i:=0; i<max_thread; i++ {
+		go func() {
+			for {
+				r := <- chan_r
+				if r.md5Hash != nil {
+					//t1 := time.Now().UnixNano()
+					r.md5Hash.Sum(nil);
+					//t2 := time.Now().UnixNano()
+					//td := t2 - t1
+					
+					//golog.Println("t1:", t1, "t2:", t2, "QAT:", td)
+				}
+			}
+		} ()
+	}
+}
 
 // Reader writes what it reads from an io.Reader to an MD5 and SHA256 hash.Hash.
 // Reader verifies that the content of the io.Reader matches the expected checksums.
@@ -179,8 +205,6 @@ func NewReader(src io.Reader, size int64, md5Hex, sha256Hex string, actualSize i
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
-	//golog.Println("len(p)=", len(p), p[0], p[1], p[2], p[len(p)-1])
-	
 	n, err = r.src.Read(p)
 	if n > 0 {
 		if r.md5Hash != nil {
@@ -227,6 +251,32 @@ func (r *Reader) MD5Current() []byte {
 	return nil
 }
 
+func (r *Reader) MD5Sum() {
+	if r.md5Hash != nil {
+		tp := reflect.TypeOf(r.md5Hash).String()
+		if tp == "*hash.md5cache" {
+			chan_r <- r
+		}
+	}
+}
+
+func (r *Reader) GetQATEng() (int) {
+	if r.md5Hash != nil {
+		tp := reflect.TypeOf(r.md5Hash).String()
+		if tp == "*hash.md5cache" {
+			if m, ok := r.md5Hash.(*md5cache); ok {
+				if m.eng_i < 0 {
+					atomic.AddInt32(&inflight_engine_num, 1)
+					m.eng_i = <-chan_engines
+					C.reset_engine(C.int(m.eng_i))
+				}
+				return m.eng_i
+			}
+		}
+	}
+	return -1
+}
+/*
 func (r *Reader) IsQATHasher() (bool) {
 	if r.md5Hash != nil {
 		tp := reflect.TypeOf(r.md5Hash).String()
@@ -237,36 +287,6 @@ func (r *Reader) IsQATHasher() (bool) {
 	return false
 }
 
-func (r *Reader) MD5Sum() {
-	if r.md5Hash != nil {
-		tp := reflect.TypeOf(r.md5Hash).String()
-		if tp == "*hash.md5cache" {
-			if m, ok := r.md5Hash.(*md5cache); ok {
-				m.Sum(nil)
-				return
-			}
-		}
-	}
-	return
-}
-
-func (r *Reader) GetQATEng() (int) {
-	if r.md5Hash != nil {
-		tp := reflect.TypeOf(r.md5Hash).String()
-		if tp == "*hash.md5cache" {
-			if m, ok := r.md5Hash.(*md5cache); ok {
-				if m.eng_i < 0 {
-					inflight_engine_num = inflight_engine_num + 1
-					m.eng_i = <-chan_engines
-					C.reset_engine(C.int(m.eng_i))
-				}
-				return m.eng_i
-			}
-		}
-	}
-	return -1
-}
-
 func (r *Reader) PutQATEng() (error) {
 	if r.md5Hash != nil {
 		tp := reflect.TypeOf(r.md5Hash).String()
@@ -275,7 +295,7 @@ func (r *Reader) PutQATEng() (error) {
 				if m.eng_i >= 0 {
 					chan_engines <- m.eng_i
 					m.eng_i = -1
-					inflight_engine_num = inflight_engine_num - 1;
+					atomic.AddInt32(&inflight_engine_num, -1)
 					return nil
 				}
 			}
@@ -284,6 +304,7 @@ func (r *Reader) PutQATEng() (error) {
 	
 	return nil
 }
+*/
 
 // SHA256 - returns byte sha256 value
 func (r *Reader) SHA256() []byte {
@@ -310,8 +331,6 @@ func (r *Reader) SHA256HexString() string {
 func (r *Reader) verify() error {
 	if r.sha256Hash != nil && len(r.sha256sum) > 0 {
 		golog.Println("==sha256==", r.sha256Hash.BlockSize)
-		//debug.PrintStack()
-		//golog.Println("==1111111==")
 		if sum := r.sha256Hash.Sum(nil); !bytes.Equal(r.sha256sum, sum) {
 			return SHA256Mismatch{hex.EncodeToString(r.sha256sum), hex.EncodeToString(sum)}
 		}
@@ -383,10 +402,10 @@ func (r *Reader) merge(size int64, md5Hex, sha256Hex string, actualSize int64, s
 			init_once.Do(Init)
 			time.Sleep(time.Duration(200)*time.Millisecond)
 		}
-		golog.Println("new size=", size, "actualSize=", actualSize)
+		//golog.Println("new size=", size, "actualSize=", actualSize, humanize.MiByte)
 		
-		if inflight_engine_num < 54 {
-		//if 0 == 1 {
+		max_object_size := int(C.get_max_object_size()) * humanize.MiByte
+		if (4*humanize.MiByte) < size && size < int64(max_object_size) && inflight_engine_num < 54 {
 			r.md5Hash = New()
 		} else {
 			r.md5Hash = md5.New()
@@ -395,7 +414,7 @@ func (r *Reader) merge(size int64, md5Hex, sha256Hex string, actualSize int64, s
 		//r2 := C.cleanup_qat();
 		sw = sw + 1
 		if (sw%200)==0 {
-			golog.Println("====new===len(chan_engines)=", len(chan_engines), "len=", inflight_engine_num)
+			golog.Println("free qat engines=", len(chan_engines), "in use=", inflight_engine_num)
 		}
 		
 		r.md5sum = md5sum
@@ -405,18 +424,7 @@ func (r *Reader) merge(size int64, md5Hex, sha256Hex string, actualSize int64, s
 
 // Close and release resources.
 func (r *Reader) Close() error {
-	fmt.Println("123")
-	golog.Println("456")
-	/*
-	if r.md5Hash != nil {
-		typeofhasher := reflect.TypeOf(r.md5Hash)
-		fmt.Println(typeofhasher.Name(), typeofhasher.Kind())
-		
-		bufferPool.Put(r.md5Hash)
-		r.md5Hash = nil
-	}
-	*/
-
+	golog.Println("reader - close - 111")
 	// Support the io.Closer interface.
 	return nil
 }

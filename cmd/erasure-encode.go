@@ -98,6 +98,7 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 		errs:        make([]error, len(writers)),
 	}
 
+	// version check
 	max_object_size := int(C.get_max_object_size()) * (1024*1024)
 	piece_size := int(C.get_cont_piece_size())
 	piece_num := max_object_size / piece_size
@@ -111,31 +112,25 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 	buf_i := 0
 	r, ok := src.(*hash.Reader)
     if ok {
-		eng_i = r.GetQATEng()
-		
-		//tp := reflect.TypeOf(r).String()
-		//golog.Println("Encode() eng_i=", eng_i, "ok=", ok)
+		eng_i = r.GetQATEng()	//engine will be released in r.MD5Sum()
 	}
 	
 	if(eng_i >= 0) {
 		buff_arr_ := C.get_engine_buffs(C.int(eng_i))
 		buff_arr = (*[PIECE_NUM]uintptr)(buff_arr_)
-		//golog.Println(buff_arr)
 	}
-
+/*
 	defer func() {
 		if(eng_i >= 0) {
 			//release qat engine
-			r.PutQATEng()
+			//r.PutQATEng()
 		}
 	} ()
-	
+*/
 	for ; ; buf_i++ {
 		if(eng_i >= 0) {
 			buf_ := (*[PIECE_SIZE]byte)(unsafe.Pointer(buff_arr[buf_i]))
 			buf = buf_[:]
-			//golog.Println("len(buf)=", len(buf), buf[0], buf[1], buf[2], buf[PIECE_SIZE-1])
-			//buf = buf_ori[:]
 		}
 		var blocks [][]byte
 		n, err := io.ReadFull(src, buf)
@@ -144,6 +139,18 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			return 0, err
 		}
 		eof := err == io.EOF || err == io.ErrUnexpectedEOF
+		if(eng_i >= 0) {
+			if(eof || (n == 0 && total != 0)) {
+				//write data (offset)
+				ret := C.md5_write(C.int(eng_i), (*C.uchar)(unsafe.Pointer(&buf[0])), C.int(total+int64(n)), 0);
+				if ret != 0 {
+					golog.Println("======= md5_write failure =========")
+				}
+		
+				//calculate md5, QAT engine will be released
+				r.MD5Sum()
+			}
+		}
 		if n == 0 && total != 0 {
 			// Reached EOF, nothing more to be done.
 			break
@@ -163,16 +170,6 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 		if eof {
 			break
 		}
-	}
-	if(eng_i >= 0) {
-		//write data (offset)
-		ret := C.md5_write(C.int(eng_i), (*C.uchar)(unsafe.Pointer(&buf[0])), C.int(total), 0);
-		if ret != 0 {
-			golog.Println("======= md5_write failure =========")
-		}
-		
-		//calculate md5
-		r.MD5Sum()
 	}
 		
 	return total, nil
