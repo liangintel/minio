@@ -16,28 +16,12 @@
 
 package cmd
 
-/*
-#cgo CFLAGS: -I/opt/stack/qat/quickassist/lookaside/access_layer/src/sample_code/functional/sym/qat_hash
-#cgo LDFLAGS:  -lssl -lcrypto -lqat_hash -L/opt/stack/qat/quickassist/lookaside/access_layer/src/sample_code/functional/sym/qat_hash
-#include <stdio.h>
-#include <stdlib.h>
-#include <openssl/md5.h> //may need to install `apt install libssl-dev`
-#include "qat_hash.h"
-
-*/
-import "C"
-
 import (
 	"context"
 	"io"
 
 	"sync"
-	//"reflect"
-	"unsafe"
-	//"fmt"
-	//"sync/atomic"
-	//"time"
-	golog "log"
+	md5accel "md5accel"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
@@ -87,9 +71,6 @@ func (p *parallelWriter) Write(ctx context.Context, blocks [][]byte) error {
 	return reduceWriteQuorumErrs(ctx, p.errs, objectOpIgnoredErrs, p.writeQuorum)
 }
 
-const PIECE_NUM = 32
-const PIECE_SIZE = (4*1024*1024)
-var g_request_cnt int32 = 0
 // Encode reads from the reader, erasure-encodes the data and writes to the writers.
 func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer, buf_ori []byte, quorum int) (total int64, err error) {
 	writer := &parallelWriter{
@@ -98,39 +79,16 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 		errs:        make([]error, len(writers)),
 	}
 
-	// version check
-	max_object_size := int(C.get_max_object_size()) * (1024*1024)
-	piece_size := int(C.get_cont_piece_size())
-	piece_num := max_object_size / piece_size
-	if(piece_num != PIECE_NUM) {
-		golog.Println("Failure: piece_num mismatch!")
-	}
-
 	eng_i := -1
 	buf := buf_ori[:]
-	var buff_arr *[PIECE_NUM]uintptr
-	buf_i := 0
 	r, ok := src.(*hash.Reader)
     if ok {
-		eng_i = r.GetQATEng()	//engine will be released in r.MD5Sum()
+		eng_i = md5accel.GetAccelerator(r.Md5Hash)	//engine will be released in MD5Sum()
 	}
-	
-	if(eng_i >= 0) {
-		buff_arr_ := C.get_engine_buffs(C.int(eng_i))
-		buff_arr = (*[PIECE_NUM]uintptr)(buff_arr_)
-	}
-/*
-	defer func() {
+
+	for {
 		if(eng_i >= 0) {
-			//release qat engine
-			//r.PutQATEng()
-		}
-	} ()
-*/
-	for ; ; buf_i++ {
-		if(eng_i >= 0) {
-			buf_ := (*[PIECE_SIZE]byte)(unsafe.Pointer(buff_arr[buf_i]))
-			buf = buf_[:]
+			buf = md5accel.Accel_get_next_buff(r.Md5Hash)
 		}
 		var blocks [][]byte
 		n, err := io.ReadFull(src, buf)
@@ -142,13 +100,10 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 		if(eng_i >= 0) {
 			if(eof || (n == 0 && total != 0)) {
 				//write data (offset)
-				ret := C.md5_write(C.int(eng_i), (*C.uchar)(unsafe.Pointer(&buf[0])), C.int(total+int64(n)), 0);
-				if ret != 0 {
-					golog.Println("======= md5_write failure =========")
-				}
+				md5accel.Accel_write_data(eng_i, buf, total+int64(n))
 		
 				//calculate md5, QAT engine will be released
-				r.MD5Sum()
+				md5accel.MD5Sum(r.Md5Hash)
 			}
 		}
 		if n == 0 && total != 0 {
@@ -161,7 +116,7 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			logger.LogIf(ctx, err)
 			return 0, err
 		}
-
+		
 		if err = writer.Write(ctx, blocks); err != nil {
 			logger.LogIf(ctx, err)
 			return 0, err
@@ -171,6 +126,9 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			break
 		}
 	}
-		
+	if(eng_i >= 0) {
+		md5accel.MD5Sum(r.Md5Hash)
+	}
+	
 	return total, nil
 }

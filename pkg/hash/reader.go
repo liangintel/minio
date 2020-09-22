@@ -16,17 +16,6 @@
 
 package hash
 
-/*
-#cgo CFLAGS: -I/opt/stack/qat/quickassist/lookaside/access_layer/src/sample_code/functional/sym/qat_hash
-#cgo LDFLAGS:  -lssl -lcrypto -lqat_hash -L/opt/stack/qat/quickassist/lookaside/access_layer/src/sample_code/functional/sym/qat_hash
-#include <stdio.h>
-#include <stdlib.h>
-#include <openssl/md5.h> //may need to install `apt install libssl-dev`
-#include "qat_hash.h"
-
-*/
-import "C"
-
 import (
 	"bytes"
 	"crypto/md5"
@@ -35,149 +24,11 @@ import (
 	"errors"
 	"hash"
 	"io"
-	"fmt"
-	"sync"
-	"unsafe"
-	"reflect"
-	"time"
-	
-	golog "log"
-	"sync/atomic"
-//	"runtime/debug"
 
+	md5accel "md5accel"
 	sha256 "github.com/minio/sha256-simd"
 	humanize "github.com/dustin/go-humanize"
 )
-
-var init_once sync.Once
-var inited int = 0
-var max_engine int = 0
-var chan_engines chan int
-
-var sw int = 1
-var inflight_engine_num int32 = 0
-
-// The size of an MD5 checksum in bytes.
-const Md5Size = 16
-
-
-func Init() {
-	golog.Println("======= chan_engines Init IN =======")
-	max_engine = int(C.get_engine_num())
-	chan_engines=make(chan int, max_engine)
-	
-	r := C.init_qat()
-	max_object_size := int(C.get_max_object_size())
-	fmt.Println("init_qat:", r, "max_engine:", max_engine, "max_object_size:", max_object_size)
-    
-	for j:=0;j<max_engine;j++ {
-		eng_i := C.get_engine()
-		if eng_i < 0 {
-		    fmt.Println("failure. index:", j, " eng_i:", eng_i)
-		    return;
-		}
-		chan_engines<-int(eng_i)
-	}
-	
-	init_sum_threads()
-	
-	inited = 1
-	fmt.Println("inited.")
-}
-
-type md5cache struct {
-	eng_i int
-	blocksize int
-	sum_inflight chan int
-	digest []byte
-}
-
-func New() hash.Hash {
-	init_once.Do(Init)
-	
-	//m := bufferPool.Get().(hash.Hash)
-	var m hash.Hash = new(md5cache)
-	m.Reset()
-	return m
-}
-
-func (m *md5cache) Size() int { return Md5Size }
-
-func (m *md5cache) Write(data []byte) (nn int, err error) {
-	// data is already written to the qat buffer
-	m.blocksize += len(data)
-	return m.blocksize, nil
-}
-
-func (m *md5cache) Sum(data []byte) []byte {
-	inflight := <- m.sum_inflight
-
-	if(m.digest[0] != 0 || m.digest[1] != 0 || m.digest[2] != 0) {
-		//fmt.Println("digest2:", hex.EncodeToString(m.digest))
-		m.sum_inflight <- (inflight + 1)
-		return m.digest
-	}
-	
-	if m.eng_i < 0 {
-		golog.Println("failure. m.eng_i=", m.eng_i, "m.digest=", m.digest, "len(data)=", len(data))
-	}
-
-	if len(data) > 0 {
-		r := C.md5_write(C.int(m.eng_i), (*C.uchar)(unsafe.Pointer(&data[0])), C.int(len(data)), 1);
-		if r != 0 {
-			golog.Println("======= md5_write2 failure =========")
-		}
-	}
-	
-	r2 := C.md5_sum(C.int(m.eng_i), (*C.uchar)(unsafe.Pointer(&m.digest[0])))
-	if r2 != 0 {
-		golog.Println("======= md5_sum failure =========")
-	}
-	
-	chan_engines <- m.eng_i
-	m.eng_i = -1
-	atomic.AddInt32(&inflight_engine_num, -1)
-	
-	//fmt.Println(m.blocksize, "digest:", hex.EncodeToString(m.digest))
-	m.sum_inflight <- (inflight + 1)
-
-	return m.digest
-}
-
-func (m *md5cache) Reset() {
-	m.blocksize = 0
-	m.eng_i = -1
-	m.digest = make([]byte, 16)
-	m.sum_inflight = make(chan int, 1)
-	m.sum_inflight <- 0
-}
-
-func (m *md5cache) BlockSize() int {
-	return m.blocksize
-}
-
-var max_r int = 120
-var max_thread int = 120
-var chan_r chan *Reader
-
-func init_sum_threads() {
-	chan_r = make(chan *Reader, max_r)
-	for i:=0; i<max_thread; i++ {
-		go func() {
-			for {
-				r := <- chan_r
-				if r.md5Hash != nil {
-					//t1 := time.Now().UnixNano()
-					r.md5Hash.Sum(nil);
-					//t2 := time.Now().UnixNano()
-					//td := t2 - t1
-					
-					//golog.Println("t1:", t1, "t2:", t2, "QAT:", td)
-				}
-			}
-		} ()
-	}
-}
 
 // Reader writes what it reads from an io.Reader to an MD5 and SHA256 hash.Hash.
 // Reader verifies that the content of the io.Reader matches the expected checksums.
@@ -188,7 +39,7 @@ type Reader struct {
 	bytesRead  int64
 
 	md5sum, sha256sum   []byte // Byte values of md5sum, sha256sum of client sent values.
-	md5Hash, sha256Hash hash.Hash
+	Md5Hash, sha256Hash hash.Hash
 }
 
 // NewReader returns a new hash Reader which computes the MD5 sum and
@@ -207,8 +58,8 @@ func NewReader(src io.Reader, size int64, md5Hex, sha256Hex string, actualSize i
 func (r *Reader) Read(p []byte) (n int, err error) {
 	n, err = r.src.Read(p)
 	if n > 0 {
-		if r.md5Hash != nil {
-			r.md5Hash.Write(p[:n])
+		if r.Md5Hash != nil {
+			r.Md5Hash.Write(p[:n])
 		}
 		if r.sha256Hash != nil {
 			r.sha256Hash.Write(p[:n])
@@ -245,66 +96,11 @@ func (r *Reader) MD5() []byte {
 // NOTE: Calling this function multiple times might yield
 // different results if they are intermixed with Reader.
 func (r *Reader) MD5Current() []byte {
-	if r.md5Hash != nil {
-		return r.md5Hash.Sum(nil)
+	if r.Md5Hash != nil {
+		return r.Md5Hash.Sum(nil)
 	}
 	return nil
 }
-
-func (r *Reader) MD5Sum() {
-	if r.md5Hash != nil {
-		tp := reflect.TypeOf(r.md5Hash).String()
-		if tp == "*hash.md5cache" {
-			chan_r <- r
-		}
-	}
-}
-
-func (r *Reader) GetQATEng() (int) {
-	if r.md5Hash != nil {
-		tp := reflect.TypeOf(r.md5Hash).String()
-		if tp == "*hash.md5cache" {
-			if m, ok := r.md5Hash.(*md5cache); ok {
-				if m.eng_i < 0 {
-					atomic.AddInt32(&inflight_engine_num, 1)
-					m.eng_i = <-chan_engines
-					C.reset_engine(C.int(m.eng_i))
-				}
-				return m.eng_i
-			}
-		}
-	}
-	return -1
-}
-/*
-func (r *Reader) IsQATHasher() (bool) {
-	if r.md5Hash != nil {
-		tp := reflect.TypeOf(r.md5Hash).String()
-		if tp == "*hash.md5cache" {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *Reader) PutQATEng() (error) {
-	if r.md5Hash != nil {
-		tp := reflect.TypeOf(r.md5Hash).String()
-		if tp == "*hash.md5cache" {
-			if m, ok := r.md5Hash.(*md5cache); ok {
-				if m.eng_i >= 0 {
-					chan_engines <- m.eng_i
-					m.eng_i = -1
-					atomic.AddInt32(&inflight_engine_num, -1)
-					return nil
-				}
-			}
-		}
-	}
-	
-	return nil
-}
-*/
 
 // SHA256 - returns byte sha256 value
 func (r *Reader) SHA256() []byte {
@@ -330,18 +126,14 @@ func (r *Reader) SHA256HexString() string {
 // equal to the ones specified when creating the Reader.
 func (r *Reader) verify() error {
 	if r.sha256Hash != nil && len(r.sha256sum) > 0 {
-		golog.Println("==sha256==", r.sha256Hash.BlockSize)
 		if sum := r.sha256Hash.Sum(nil); !bytes.Equal(r.sha256sum, sum) {
 			return SHA256Mismatch{hex.EncodeToString(r.sha256sum), hex.EncodeToString(sum)}
 		}
 	}
-	if r.md5Hash != nil && len(r.md5sum) > 0 {
-		golog.Println("==md5==")
-		sum := r.md5Hash.Sum(nil);
-		if !bytes.Equal(r.md5sum, sum) {
+	if r.Md5Hash != nil && len(r.md5sum) > 0 {
+		if sum := r.Md5Hash.Sum(nil); !bytes.Equal(r.md5sum, sum) {
 			return BadDigest{hex.EncodeToString(r.md5sum), hex.EncodeToString(sum)}
 		}
-		golog.Println("calculate sum:", sum, " - input sum:", r.md5sum)
 	}
 	return nil
 }
@@ -389,32 +181,15 @@ func (r *Reader) merge(size int64, md5Hex, sha256Hex string, actualSize int64, s
 		return nil, BadDigest{}
 	}
 	// If both are set, they must expect the same.
-	if r.md5Hash != nil && len(md5sum) > 0 {
+	if r.Md5Hash != nil && len(md5sum) > 0 {
 		if !bytes.Equal(r.md5sum, md5sum) {
 			return nil, BadDigest{}
 		}
-	} else if len(md5sum) > 0 || (r.md5Hash == nil && strictCompat) {
-		for {
-			if (inited != 0) {
-				break
-			}
-			
-			init_once.Do(Init)
-			time.Sleep(time.Duration(200)*time.Millisecond)
-		}
-		//golog.Println("new size=", size, "actualSize=", actualSize, humanize.MiByte)
-		
-		max_object_size := int(C.get_max_object_size()) * humanize.MiByte
-		if (4*humanize.MiByte) < size && size < int64(max_object_size) && inflight_engine_num < 54 {
-			r.md5Hash = New()
+	} else if len(md5sum) > 0 || (r.Md5Hash == nil && strictCompat) {
+		if (4*humanize.MiByte) < size && size < md5accel.Get_max_object_size() && md5accel.Get_inflight_engine_num() < 18 {
+			r.Md5Hash = md5accel.New()
 		} else {
-			r.md5Hash = md5.New()
-		}
-		
-		//r2 := C.cleanup_qat();
-		sw = sw + 1
-		if (sw%200)==0 {
-			golog.Println("free qat engines=", len(chan_engines), "in use=", inflight_engine_num)
+			r.Md5Hash = md5.New()
 		}
 		
 		r.md5sum = md5sum
@@ -424,7 +199,6 @@ func (r *Reader) merge(size int64, md5Hex, sha256Hex string, actualSize int64, s
 
 // Close and release resources.
 func (r *Reader) Close() error {
-	golog.Println("reader - close - 111")
 	// Support the io.Closer interface.
 	return nil
 }
