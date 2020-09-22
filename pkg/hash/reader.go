@@ -25,7 +25,7 @@ import (
 	"hash"
 	"io"
 
-	md5accel "md5accel"
+	md5accel "github.com/liangintel/md5accel/go"
 	sha256 "github.com/minio/sha256-simd"
 	humanize "github.com/dustin/go-humanize"
 )

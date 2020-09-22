@@ -21,8 +21,8 @@ import (
 	"io"
 
 	"sync"
-	md5accel "md5accel"
 
+	md5accel "github.com/liangintel/md5accel/go"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
 )
