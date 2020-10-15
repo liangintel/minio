@@ -22,7 +22,7 @@ import (
 
 	"sync"
 
-	md5accel "github.com/liangintel/md5accel/go"
+	md5accel "github.com/liangintel/md5accel"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/hash"
 )
@@ -79,15 +79,18 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 		errs:        make([]error, len(writers)),
 	}
 
-	eng_i := -1
-	buf := buf_ori[:]
-	r, ok := src.(*hash.Reader)
+	eng := -1					// init the md5 hw engine index to negative value means no hw engine involved
+	buf := buf_ori[:]			// later will be changed to hw buf if hw involved
+	r, ok := src.(*hash.Reader) // check if it's hash.Reader which contains Md5Hash field
     if ok {
-		eng_i = md5accel.GetAccelerator(r.Md5Hash)	//engine will be released in MD5Sum()
+		// try to get the md5 engine, engine will be released in subsequent call MD5Sum()
+		eng = md5accel.GetAccelerator(r.Md5Hash)
+		md5accel.Set_zero_cpy(r.Md5Hash)
 	}
 
 	for {
-		if(eng_i >= 0) {
+		if(eng >= 0) {
+			// re-use buf from hw, so no memcpy happen between hw and minio, this can increase ~3% throughput
 			buf = md5accel.Accel_get_next_buff(r.Md5Hash)
 		}
 		var blocks [][]byte
@@ -97,12 +100,13 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			return 0, err
 		}
 		eof := err == io.EOF || err == io.ErrUnexpectedEOF
-		if(eng_i >= 0) {
+		if(eng >= 0) {
 			if(eof || (n == 0 && total != 0)) {
-				//write data (offset)
-				md5accel.Accel_write_data(eng_i, buf, total+int64(n))
+				// this just tell hw the total length of the object, data itself actually already in hw buf
+				md5accel.Accel_write_data(eng, buf, total+int64(n))
 		
-				//calculate md5, QAT engine will be released
+				// trigger hw to calculate md5 here in a go routing, this will be running parallel with subsequent
+				// calls of e.EncodeData and writer.Write. Engine will be released here.
 				md5accel.MD5Sum(r.Md5Hash)
 			}
 		}
@@ -126,7 +130,8 @@ func (e *Erasure) Encode(ctx context.Context, src io.Reader, writers []io.Writer
 			break
 		}
 	}
-	if(eng_i >= 0) {
+	if(eng >= 0) {
+		// make sure md5 is calculated.
 		md5accel.MD5Sum(r.Md5Hash)
 	}
 	

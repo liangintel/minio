@@ -25,9 +25,10 @@ import (
 	"hash"
 	"io"
 
-	md5accel "github.com/liangintel/md5accel/go"
+	md5accel "github.com/liangintel/md5accel"
 	sha256 "github.com/minio/sha256-simd"
 	humanize "github.com/dustin/go-humanize"
+	"github.com/minio/minio/pkg/env"
 )
 
 // Reader writes what it reads from an io.Reader to an MD5 and SHA256 hash.Hash.
@@ -186,7 +187,10 @@ func (r *Reader) merge(size int64, md5Hex, sha256Hex string, actualSize int64, s
 			return nil, BadDigest{}
 		}
 	} else if len(md5sum) > 0 || (r.Md5Hash == nil && strictCompat) {
-		if (4*humanize.MiByte) < size && size < md5accel.Get_max_object_size() && md5accel.Get_inflight_engine_num() < 18 {
+		// hw only offload object with size between 4MB and 128MB. Not efficient if too small or too big
+		if "QAT" == env.Get("MINIO_MD5_HW_OFFLOAD", "") &&
+		   (4*humanize.MiByte) < size && size < md5accel.Get_max_object_size() &&
+		   md5accel.Get_inflight_engine_num() < md5accel.Max_engine {
 			r.Md5Hash = md5accel.New()
 		} else {
 			r.Md5Hash = md5.New()
